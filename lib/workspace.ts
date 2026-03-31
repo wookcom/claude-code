@@ -1,108 +1,88 @@
-import { execFile } from 'child_process'
-import type { Dirent } from 'fs'
-import { readdir, readFile, stat } from 'fs/promises'
-import path from 'path'
-import { promisify } from 'util'
-
-const execFileAsync = promisify(execFile)
-
 const MAX_FILES = 500
-const MAX_DEPTH = 6
-const MAX_READ_BYTES = 220_000
 
-const SKIP_DIRS = new Set([
-  '.git',
-  'node_modules',
-  '.next',
-  'dist',
-  'build',
-  'coverage',
-])
+const repoOwner = process.env.GITHUB_REPO_OWNER ?? 'wookcom'
+const repoName = process.env.GITHUB_REPO_NAME ?? 'claude-code'
+const repoRef = process.env.GITHUB_REPO_REF ?? 'main'
+const githubToken = process.env.GITHUB_TOKEN
 
-export const workspaceRoot = process.cwd()
+function githubHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+  }
+  if (githubToken) {
+    headers.Authorization = `Bearer ${githubToken}`
+  }
+  return headers
+}
 
 export function sanitizePath(input: string): string | null {
   if (!input) return null
   const cleaned = input.replace(/\\/g, '/').replace(/^\/+/, '')
   if (!cleaned || cleaned.includes('..')) return null
-  const full = path.resolve(workspaceRoot, cleaned)
-  if (!full.startsWith(workspaceRoot)) return null
   return cleaned
 }
 
 export async function listWorkspaceFiles(): Promise<string[]> {
-  const out: string[] = []
+  const response = await fetch(
+    `https://api.github.com/repos/${repoOwner}/${repoName}/git/trees/${repoRef}?recursive=1`,
+    {
+      headers: githubHeaders(),
+      cache: 'no-store',
+    },
+  )
 
-  const walk = async (dir: string, depth: number): Promise<void> => {
-    if (out.length >= MAX_FILES || depth > MAX_DEPTH) return
-    let entries: Dirent[]
-    try {
-      entries = await readdir(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-
-    entries.sort((a, b) => a.name.localeCompare(b.name))
-
-    for (const entry of entries) {
-      if (out.length >= MAX_FILES) return
-      const abs = path.resolve(dir, entry.name)
-      const rel = path.relative(workspaceRoot, abs).replace(/\\/g, '/')
-      if (!rel || rel.startsWith('..')) continue
-
-      if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name)) continue
-        await walk(abs, depth + 1)
-      } else if (entry.isFile()) {
-        out.push(rel)
-      }
-    }
+  if (!response.ok) {
+    throw new Error('github_tree_fetch_failed')
   }
 
-  await walk(workspaceRoot, 0)
-  return out
+  const data = (await response.json()) as {
+    tree?: Array<{ path: string; type: string }>
+  }
+
+  return (data.tree ?? [])
+    .filter(entry => entry.type === 'blob')
+    .map(entry => entry.path)
+    .slice(0, MAX_FILES)
 }
 
 export async function readWorkspaceFile(relPath: string): Promise<string> {
   const safe = sanitizePath(relPath)
   if (!safe) throw new Error('invalid_path')
-  const full = path.resolve(workspaceRoot, safe)
-  const fileStat = await stat(full)
-  if (!fileStat.isFile()) throw new Error('not_file')
-  if (fileStat.size > MAX_READ_BYTES) {
-    throw new Error('file_too_large')
+  const encodedPath = safe.split('/').map(encodeURIComponent).join('/')
+
+  const response = await fetch(
+    `https://api.github.com/repos/${repoOwner}/${repoName}/contents/${encodedPath}?ref=${repoRef}`,
+    {
+      headers: githubHeaders(),
+      cache: 'no-store',
+    },
+  )
+
+  if (!response.ok) {
+    throw new Error('github_file_fetch_failed')
   }
-  return readFile(full, 'utf-8')
+
+  const data = (await response.json()) as {
+    content?: string
+    encoding?: string
+  }
+
+  if (!data.content || data.encoding !== 'base64') {
+    throw new Error('unsupported_file_payload')
+  }
+
+  return Buffer.from(data.content, 'base64').toString('utf-8')
 }
 
-export async function gitDiffForFile(relPath: string): Promise<string> {
-  const safe = sanitizePath(relPath)
-  if (!safe) throw new Error('invalid_path')
-
-  try {
-    const { stdout } = await execFileAsync(
-      'git',
-      ['--no-optional-locks', 'diff', 'HEAD', '--', safe],
-      {
-        cwd: workspaceRoot,
-        timeout: 8_000,
-        maxBuffer: 2_000_000,
-      },
-    )
-    return stdout
-  } catch {
-    return ''
-  }
+export async function gitDiffForFile(_relPath: string): Promise<string> {
+  return ''
 }
 
 const SAFE_COMMANDS = new Set([
   'git status --short --branch',
-  'git status',
   'git diff --stat',
   'git diff --name-only',
-  'npm test',
   'npm run build',
-  'bun test',
 ])
 
 export async function runSafeCommand(command: string): Promise<{
@@ -115,29 +95,14 @@ export async function runSafeCommand(command: string): Promise<{
     return {
       code: 1,
       stdout: '',
-      stderr:
-        'Comando no permitido por seguridad. Usa uno de los comandos predefinidos.',
+      stderr: 'Comando no permitido por seguridad.',
     }
   }
 
-  const [bin, ...args] = normalized.split(' ')
-  if (!bin) {
-    return { code: 1, stdout: '', stderr: 'Comando invalido' }
-  }
-
-  try {
-    const { stdout, stderr } = await execFileAsync(bin, args, {
-      cwd: workspaceRoot,
-      timeout: 20_000,
-      maxBuffer: 2_000_000,
-    })
-    return { code: 0, stdout, stderr }
-  } catch (error) {
-    const e = error as { stdout?: string; stderr?: string; code?: number }
-    return {
-      code: typeof e.code === 'number' ? e.code : 1,
-      stdout: e.stdout ?? '',
-      stderr: e.stderr ?? 'Fallo al ejecutar comando',
-    }
+  return {
+    code: 0,
+    stdout: `Comando aceptado: ${normalized}`,
+    stderr:
+      'En Vercel web mode no se ejecutan procesos locales; integra un backend worker para ejecucion real.',
   }
 }
